@@ -1,15 +1,17 @@
 # ============================================================
 #  MAIN - Arranque del bot + comandos de perfil, admin y arena PvP
-#  Comandos: /raza /perfil /evolucionar /evolucion_definitiva /mejorar
-#            /habilidad /habilidades /arena desafiar /arena ranking
-#            /admin_* (solo el administrador unico)
-#  Variable de Railway para el admin: ADMIN_ID = tu ID de Discord
-#  (si no la pones, el unico admin es el dueño del servidor).
+#  Comandos: /raza (al azar) /perfil /evolucionar /evolucion_definitiva /mejorar
+#            /habilidad /habilidades /diario /entrenar /pagar /top
+#            /arena desafiar /arena ranking
+#            /configuracion (panel del dueño del servidor)
+#            /admin_* (solo dueño + las personas/roles que el dueño elija)
+#  Opcional en Railway: ADMIN_ID = tu ID de Discord (admin extra fijo).
 # ============================================================
 import copy
 import os
 import random
 import traceback
+from datetime import date, timedelta
 
 import discord
 from discord import app_commands
@@ -22,21 +24,30 @@ from habilidades import texto_habilidad
 
 
 # ============================================================
-#  ADMINISTRADOR UNICO
+#  QUIEN ES ADMIN DEL BOT
+#  El dueño del servidor siempre. Ademas, las personas y roles que el
+#  dueño elija en /configuracion (y, si existe, el ADMIN_ID de Railway).
 # ============================================================
 def es_admin_unico(interaction: discord.Interaction) -> bool:
-    """Solo UNA persona es admin del bot: la del ID en la variable ADMIN_ID.
-    Si no hay ADMIN_ID, el admin es el dueño del servidor."""
+    if es_dueno_servidor(interaction):
+        return True
     admin_id = os.getenv("ADMIN_ID", "").strip()
-    if admin_id.isdigit():
-        return interaction.user.id == int(admin_id)
-    return es_dueno_servidor(interaction)
+    if admin_id.isdigit() and interaction.user.id == int(admin_id):
+        return True
+    conf = config_guild(interaction.guild_id)
+    if interaction.user.id in conf.get("admin_usuarios", []):
+        return True
+    ids_roles = set(conf.get("admin_roles", []))
+    return any(r.id in ids_roles for r in getattr(interaction.user, "roles", []))
 
 
 async def exigir_admin(interaction: discord.Interaction) -> bool:
     if es_admin_unico(interaction):
         return True
-    await interaction.response.send_message("🚫 Solo el administrador del bot puede usar este comando.", ephemeral=True)
+    await interaction.response.send_message(
+        "🚫 No tienes permiso para este comando. El dueño del servidor decide quién es admin con /configuracion.",
+        ephemeral=True,
+    )
     return False
 
 
@@ -69,95 +80,87 @@ def _pvp(ficha):
 
 
 # ============================================================
-#  /raza  -> crear personaje
+#  /raza  -> tu raza sale AL AZAR
+#  Tienes 3 tiradas en total (la primera te la asigna; puedes volver a tirar 2 veces).
+#  Las razas dificiles son mas raras. Al evolucionar o ganar EXP ya no se puede cambiar.
 # ============================================================
-class SelectCategoria(discord.ui.Select):
-    def __init__(self, elegida=None):
-        opciones = [
-            discord.SelectOption(
-                label=c["nombre"], value=cid, emoji=c["emoji"],
-                description=c["descripcion"][:100], default=(cid == elegida),
-            )
-            for cid, c in CATEGORIAS.items()
-        ]
-        super().__init__(placeholder="1) Elige una categoría", options=opciones, row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        vista = VistaRaza(self.view.dueno_id, categoria=self.values[0])
-        await interaction.response.edit_message(content=TEXTO_RAZAS, embed=None, view=vista)
+TIRADAS_RAZA_MAX = 3
+PESOS_DIFICULTAD_RAZA = {1: 30, 2: 30, 3: 20, 4: 12, 5: 8}   # a mas dificil, mas rara
 
 
-class SelectRaza(discord.ui.Select):
-    def __init__(self, categoria, elegida=None):
-        opciones = [
-            discord.SelectOption(
-                label=r["nombre"], value=rid, emoji=r["emoji"],
-                description=texto_dificultad(r["dificultad"]).replace("🔥", "")[:100].strip(),
-                default=(rid == elegida),
-            )
-            for rid, r in RAZAS.items() if r["cat"] == categoria
-        ]
-        super().__init__(placeholder="2) Elige una raza", options=opciones[:25], row=1)
-        self.categoria = categoria
-
-    async def callback(self, interaction: discord.Interaction):
-        rid = self.values[0]
-        vista = VistaRaza(self.view.dueno_id, categoria=self.categoria, raza=rid)
-        await interaction.response.edit_message(content=None, embed=embed_raza(rid), view=vista)
+def tirar_raza(excluir=None):
+    ids = [rid for rid, r in RAZAS.items() if r["cat"] in CATEGORIAS and rid != excluir]
+    pesos = [PESOS_DIFICULTAD_RAZA.get(RAZAS[i]["dificultad"], 10) for i in ids]
+    return random.choices(ids, weights=pesos)[0]
 
 
-class BotonConfirmarRaza(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Elegir esta raza", emoji="✅", style=discord.ButtonStyle.success, row=2)
+def asignar_raza(ficha, rid):
+    anterior = RAZAS.get(ficha["raza_id"])
+    ep_anterior = anterior["ep_inicial"] if anterior else 0
+    ficha["raza_id"] = rid
+    ficha["raza"] = RAZAS[rid]["nombre"]
+    ficha["etapa"] = 0
+    ficha["ep"] = max(0, ficha["ep"] - ep_anterior + RAZAS[rid]["ep_inicial"])
 
-    async def callback(self, interaction: discord.Interaction):
-        rid = self.view.raza
-        ficha = obtener_ficha(self.view.dueno_id, crear=True)
-        if ya_evoluciono(ficha):
-            await interaction.response.edit_message(
-                content="Ya avanzaste con tu raza y no se puede cambiar.", embed=None, view=None
-            )
+
+def embed_tirada_raza(rid, ficha):
+    embed = embed_raza(rid)
+    embed.title = f'🎲 ¡Te tocó: {RAZAS[rid]["emoji"]} {RAZAS[rid]["nombre"]}!'
+    restantes = TIRADAS_RAZA_MAX - ficha.get("tiradas_raza", 0)
+    embed.set_footer(text=f"Tiradas restantes: {restantes} · Cuando ganes EXP tu raza queda fija.")
+    return embed
+
+
+class VistaRazaAzar(VistaBase):
+    def __init__(self, dueno_id, ficha):
+        super().__init__(dueno_id)
+        self.volver.disabled = ficha.get("tiradas_raza", 0) >= TIRADAS_RAZA_MAX
+        self.volver.label = f'Volver a tirar ({TIRADAS_RAZA_MAX - ficha.get("tiradas_raza", 0)})'
+
+    @discord.ui.button(label="Volver a tirar", emoji="🎲", style=discord.ButtonStyle.primary)
+    async def volver(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ficha = obtener_ficha(self.dueno_id, crear=True)
+        if ya_evoluciono(ficha) or ficha.get("tiradas_raza", 0) >= TIRADAS_RAZA_MAX:
+            await interaction.response.edit_message(content="Tu raza ya quedó fija.", embed=None, view=None)
             return
-        anterior = RAZAS.get(ficha["raza_id"])
-        ep_anterior = anterior["ep_inicial"] if anterior else 0
-        ficha["raza_id"] = rid
-        ficha["raza"] = RAZAS[rid]["nombre"]
-        ficha["etapa"] = 0
-        ficha["ep"] = max(0, ficha["ep"] - ep_anterior + RAZAS[rid]["ep_inicial"])
-        guardar_ficha(self.view.dueno_id, ficha)
+        rid = tirar_raza(excluir=ficha["raza_id"])
+        asignar_raza(ficha, rid)
+        ficha["tiradas_raza"] = ficha.get("tiradas_raza", 0) + 1
+        guardar_ficha(self.dueno_id, ficha)
         await interaction.response.edit_message(
-            content=f'🌟 ¡Listo! Ahora eres **{RAZAS[rid]["nombre"]}**. Usa /perfil para ver tu personaje y /explorar para salir a pelear.',
-            embed=embed_raza(rid), view=None,
+            content=None, embed=embed_tirada_raza(rid, ficha), view=VistaRazaAzar(self.dueno_id, ficha)
+        )
+
+    @discord.ui.button(label="Quedarme con esta", emoji="✅", style=discord.ButtonStyle.success)
+    async def quedarme(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ficha = obtener_ficha(self.dueno_id, crear=True)
+        ficha["tiradas_raza"] = TIRADAS_RAZA_MAX   # decidido: ya no se puede volver a tirar
+        guardar_ficha(self.dueno_id, ficha)
+        await interaction.response.edit_message(
+            content=f'🌟 ¡Listo! Eres **{ficha["raza"]}**. Usa /perfil para ver tu personaje y /explorar para salir a pelear.',
+            embed=embed_raza(ficha["raza_id"]), view=None,
         )
 
 
-class VistaRaza(VistaBase):
-    def __init__(self, dueno_id, categoria=None, raza=None):
-        super().__init__(dueno_id)
-        self.categoria = categoria
-        self.raza = raza
-        self.add_item(SelectCategoria(categoria))
-        if categoria:
-            self.add_item(SelectRaza(categoria, raza))
-        if raza:
-            self.add_item(BotonConfirmarRaza())
-
-
-@bot.tree.command(name="raza", description="Crea tu personaje: elige tu raza")
+@bot.tree.command(name="raza", description="Crea tu personaje: tu raza sale al azar")
 @app_commands.guild_only()
 async def raza(interaction: discord.Interaction):
     if not puede_jugar(interaction):
         await interaction.response.send_message(MENSAJE_SIN_PERMISO_JUGAR, ephemeral=True)
         return
     ficha = obtener_ficha(interaction.user.id, crear=True)
-    if ya_evoluciono(ficha):
+    if ficha["raza_id"] and (ya_evoluciono(ficha) or ficha.get("tiradas_raza", 0) >= TIRADAS_RAZA_MAX):
         await interaction.response.send_message(
-            "Ya avanzaste con tu raza y no se puede cambiar. Esta es tu raza:",
-            embed=embed_raza(ficha["raza_id"]), ephemeral=True,
+            "Tu raza ya quedó fija. Esta es:", embed=embed_raza(ficha["raza_id"]), ephemeral=True
         )
         return
+    if not ficha["raza_id"]:
+        asignar_raza(ficha, tirar_raza())
+        ficha["tiradas_raza"] = 1
+        guardar_ficha(interaction.user.id, ficha)
     await interaction.response.send_message(
-        TEXTO_CATEGORIAS, view=VistaRaza(interaction.user.id), ephemeral=True
+        embed=embed_tirada_raza(ficha["raza_id"], ficha),
+        view=VistaRazaAzar(interaction.user.id, ficha), ephemeral=True,
     )
 
 
@@ -1039,6 +1042,294 @@ async def admin_rol_jugador(interaction: discord.Interaction, accion: app_comman
     guardar_config_guild(interaction.guild_id, conf)
     roles = ", ".join(f"<@&{r}>" for r in conf["jugador_roles"]) or "todos pueden jugar"
     await interaction.response.send_message(f"Roles de jugador: {roles}", ephemeral=True)
+
+
+# ============================================================
+#  /configuracion  (panel del dueño del servidor)
+# ============================================================
+def _menciones(ids, rol=False):
+    if not ids:
+        return "*Nadie todavía*"
+    pref = "@&" if rol else "@"
+    return "\n".join(f"<{pref}{i}>" for i in ids)[:1000]
+
+
+def _alternar(lista, i):
+    """Si ya estaba en la lista lo quita; si no, lo agrega."""
+    if i in lista:
+        lista.remove(i)
+    else:
+        lista.append(i)
+
+
+def embed_config(guild):
+    conf = config_guild(guild.id)
+    embed = discord.Embed(
+        title="⚙️ Panel de Configuración",
+        description=(
+            f"Bienvenido al panel de **{guild.name}**.\n"
+            "Aquí decides **quién puede usar los comandos de admin** y cómo funciona el bot.\n"
+            "▫️ Los menús *añaden o quitan*: elige a alguien que ya está y se le quita."
+        ),
+        color=0xC9A227,
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="👑 Dueño (siempre es admin)", value=f"<@{guild.owner_id}>", inline=False)
+    embed.add_field(name="🛡️ Admins (personas)", value=_menciones(conf.get("admin_usuarios", [])), inline=True)
+    embed.add_field(name="🎖️ Admins (roles)", value=_menciones(conf.get("admin_roles", []), rol=True), inline=True)
+    jugadores = conf.get("jugador_roles", [])
+    embed.add_field(
+        name="🎮 Roles que pueden jugar",
+        value=_menciones(jugadores, rol=True) if jugadores else "✅ Todo el mundo puede jugar",
+        inline=False,
+    )
+    embed.add_field(name="🪙 Moneda", value=f'{conf["moneda_emoji"]}  (ejemplo: {moneda(guild.id, 1000)})', inline=True)
+    embed.add_field(name="🧙 Personajes creados", value=f"{sum(1 for f in cargar().values() if f.get('raza_id')):,}", inline=True)
+    embed.set_footer(text="🔒 Solo el dueño del servidor puede cambiar esto")
+    return embed
+
+
+class ModalMoneda(discord.ui.Modal):
+    def __init__(self, vista):
+        super().__init__(title="Moneda del servidor")
+        self.vista = vista
+        self.campo = discord.ui.TextInput(label="Emoji de la moneda", placeholder="🪙", max_length=50)
+        self.add_item(self.campo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        conf = config_guild(interaction.guild_id)
+        conf["moneda_emoji"] = self.campo.value.strip() or "🪙"
+        guardar_config_guild(interaction.guild_id, conf)
+        await interaction.response.edit_message(embed=embed_config(interaction.guild), view=self.vista)
+
+
+class VistaConfig(VistaBase):
+    def __init__(self, dueno_id):
+        super().__init__(dueno_id, timeout=600)
+
+    async def _refrescar(self, interaction):
+        await interaction.response.edit_message(embed=embed_config(interaction.guild), view=self)
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect, row=0, min_values=1, max_values=10,
+        placeholder="👤 Añadir / quitar admins (personas)",
+    )
+    async def sel_usuarios(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        conf = config_guild(interaction.guild_id)
+        lista = conf.setdefault("admin_usuarios", [])
+        for u in select.values:
+            if u.bot or u.id == interaction.guild.owner_id:
+                continue
+            _alternar(lista, u.id)
+        guardar_config_guild(interaction.guild_id, conf)
+        await self._refrescar(interaction)
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect, row=1, min_values=1, max_values=10,
+        placeholder="🎖️ Añadir / quitar roles admin",
+    )
+    async def sel_roles_admin(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        conf = config_guild(interaction.guild_id)
+        for r in select.values:
+            if r.is_default():
+                continue
+            _alternar(conf["admin_roles"], r.id)
+        guardar_config_guild(interaction.guild_id, conf)
+        await self._refrescar(interaction)
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect, row=2, min_values=1, max_values=10,
+        placeholder="🎮 Añadir / quitar roles que pueden jugar",
+    )
+    async def sel_roles_jugador(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        conf = config_guild(interaction.guild_id)
+        for r in select.values:
+            if r.is_default():
+                continue
+            _alternar(conf["jugador_roles"], r.id)
+        guardar_config_guild(interaction.guild_id, conf)
+        await self._refrescar(interaction)
+
+    @discord.ui.button(label="Quitar admins", emoji="🧹", style=discord.ButtonStyle.secondary, row=3)
+    async def limpiar_admins(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conf = config_guild(interaction.guild_id)
+        conf["admin_usuarios"] = []
+        conf["admin_roles"] = []
+        guardar_config_guild(interaction.guild_id, conf)
+        await self._refrescar(interaction)
+
+    @discord.ui.button(label="Todos pueden jugar", emoji="🌍", style=discord.ButtonStyle.secondary, row=3)
+    async def limpiar_jugadores(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conf = config_guild(interaction.guild_id)
+        conf["jugador_roles"] = []
+        guardar_config_guild(interaction.guild_id, conf)
+        await self._refrescar(interaction)
+
+    @discord.ui.button(label="Moneda", emoji="🪙", style=discord.ButtonStyle.primary, row=3)
+    async def cambiar_moneda(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ModalMoneda(self))
+
+    @discord.ui.button(label="Actualizar", emoji="🔄", style=discord.ButtonStyle.success, row=3)
+    async def actualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._refrescar(interaction)
+
+
+@bot.tree.command(name="configuracion", description="Panel del dueño: elige quién puede usar los comandos de admin")
+@app_commands.guild_only()
+async def configuracion(interaction: discord.Interaction):
+    if not es_dueno_servidor(interaction):
+        await interaction.response.send_message("👑 Solo el dueño del servidor puede abrir este panel.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=embed_config(interaction.guild), view=VistaConfig(interaction.user.id), ephemeral=True
+    )
+
+
+# ============================================================
+#  EXTRAS DIVERTIDOS: /diario /entrenar /pagar /top
+# ============================================================
+@bot.tree.command(name="diario", description="Reclama tu recompensa diaria (con racha: cada día seguido paga más)")
+@app_commands.guild_only()
+async def diario(interaction: discord.Interaction):
+    if not puede_jugar(interaction):
+        await interaction.response.send_message(MENSAJE_SIN_PERMISO_JUGAR, ephemeral=True)
+        return
+    ficha = obtener_ficha(interaction.user.id, crear=True)
+    if not ficha["raza_id"]:
+        await interaction.response.send_message("Primero crea tu personaje con /raza.", ephemeral=True)
+        return
+    d = ficha.setdefault("diario", {"fecha": "", "racha": 0})
+    hoy = fecha_hoy()
+    if d["fecha"] == hoy:
+        await interaction.response.send_message("Ya reclamaste tu recompensa de hoy. Vuelve mañana (UTC).", ephemeral=True)
+        return
+    ayer = (date.fromisoformat(hoy) - timedelta(days=1)).isoformat()
+    d["racha"] = d["racha"] + 1 if d["fecha"] == ayer else 1
+    d["fecha"] = hoy
+    factor = 1 + rango_index(rango_por_ep(ficha["ep"]))
+    dinero = (100 + 50 * min(d["racha"], 10)) * factor
+    ficha["dinero"] += dinero
+    extras = []
+    if random.random() < 0.25:
+        clave = clave_pocion("vida", 25)
+        ficha["pociones"][clave] = ficha["pociones"].get(clave, 0) + 1
+        extras.append(f'🧪 ¡Bonus! Encontraste una {nombre_pocion("vida", 25)}.')
+    if d["racha"] % 7 == 0:
+        hid = tirar_habilidad(PESOS_ROLL)
+        ficha["habilidades"].append(hid)
+        h = HABILIDADES[hid]
+        extras.append(f'🎁 ¡Racha de {d["racha"]} días! Habilidad gratis: {RAREZA_EMOJI[h["rareza"]]} **{h["nombre"]}**.')
+    guardar_ficha(interaction.user.id, ficha)
+    embed = discord.Embed(
+        title="🎁 Recompensa diaria",
+        description=f'Recibes **{moneda(interaction.guild_id, dinero)}**.\n🔥 Racha: **{d["racha"]}** día(s)'
+                    + ("\n" + "\n".join(extras) if extras else ""),
+        color=0xF1C40F,
+    )
+    embed.set_footer(text="Entra todos los días: la racha sube el premio hasta el día 10, y cada 7 días hay habilidad gratis.")
+    await interaction.response.send_message(embed=embed)
+
+
+ENTRENAMIENTOS = [
+    "Golpeas un muñeco de paja hasta el amanecer.",
+    "Meditas bajo una cascada helada.",
+    "Corres con rocas atadas a la espalda por el bosque de Jura.",
+    "Practicas combate con un instructor veterano del gremio.",
+    "Esquivas flechas lanzadas por reclutas del gremio.",
+    "Levantas troncos en el patio de entrenamiento de Lubelius.",
+]
+COOLDOWN_ENTRENAR = 30 * 60
+
+
+@bot.tree.command(name="entrenar", description="Entrena un rato para ganar EXP y EP (cada 30 minutos)")
+@app_commands.guild_only()
+async def entrenar(interaction: discord.Interaction):
+    if not puede_jugar(interaction):
+        await interaction.response.send_message(MENSAJE_SIN_PERMISO_JUGAR, ephemeral=True)
+        return
+    ficha = obtener_ficha(interaction.user.id, crear=True)
+    if not ficha["raza_id"]:
+        await interaction.response.send_message("Primero crea tu personaje con /raza.", ephemeral=True)
+        return
+    espera = int(ficha.get("entrenar_hasta", 0) - time.time())
+    if espera > 0:
+        await interaction.response.send_message(f"Estás cansado. Podrás entrenar en {texto_tiempo(espera)}.", ephemeral=True)
+        return
+    exp = random.randint(20, 50) * (1 + ficha["etapa"])
+    critico = random.random() < 0.10
+    if critico:
+        exp *= 3
+    ep = max(1, exp // 4)
+    ficha["exp"] += exp
+    ficha["ep"] += ep
+    ficha["entrenar_hasta"] = time.time() + COOLDOWN_ENTRENAR
+    guardar_ficha(interaction.user.id, ficha)
+    texto = random.choice(ENTRENAMIENTOS)
+    if critico:
+        texto += "\n💥 ¡Entrenamiento perfecto! Ganas el triple."
+    await interaction.response.send_message(f"🏋️ {texto}\n📈 **+{exp:,} EXP** · ⚡ **+{ep:,} EP**")
+
+
+@bot.tree.command(name="pagar", description="Regala dinero a otro jugador")
+@app_commands.describe(usuario="Quién recibe el dinero", cantidad="Cuánto")
+@app_commands.guild_only()
+async def pagar(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1_000_000_000]):
+    if not puede_jugar(interaction):
+        await interaction.response.send_message(MENSAJE_SIN_PERMISO_JUGAR, ephemeral=True)
+        return
+    if usuario.bot or usuario.id == interaction.user.id:
+        await interaction.response.send_message("Elige a otro jugador.", ephemeral=True)
+        return
+    emisor = obtener_ficha(interaction.user.id, crear=True)
+    receptor = obtener_ficha(usuario.id)
+    if receptor is None or not receptor["raza_id"]:
+        await interaction.response.send_message(f"{usuario.display_name} todavía no tiene personaje.", ephemeral=True)
+        return
+    if emisor["dinero"] < cantidad:
+        await interaction.response.send_message(
+            f'No te alcanza: tienes {moneda(interaction.guild_id, emisor["dinero"])}.', ephemeral=True
+        )
+        return
+    emisor["dinero"] -= cantidad
+    receptor["dinero"] += cantidad
+    guardar_ficha(interaction.user.id, emisor)
+    guardar_ficha(usuario.id, receptor)
+    await interaction.response.send_message(
+        f"💸 {interaction.user.mention} le dio **{moneda(interaction.guild_id, cantidad)}** a {usuario.mention}."
+    )
+
+
+@bot.tree.command(name="top", description="Los mejores jugadores del bot")
+@app_commands.describe(categoria="Qué ranking quieres ver")
+@app_commands.choices(categoria=[
+    app_commands.Choice(name="⚡ Más EP", value="ep"),
+    app_commands.Choice(name="💰 Más dinero", value="dinero"),
+    app_commands.Choice(name="🏟️ Más victorias PvP", value="victorias"),
+])
+@app_commands.guild_only()
+async def top(interaction: discord.Interaction, categoria: app_commands.Choice[str]):
+    filas = []
+    for uid, f in cargar().items():
+        if not f.get("raza_id"):
+            continue
+        if categoria.value == "victorias":
+            valor = f.get("pvp", {}).get("victorias", 0)
+        else:
+            valor = f.get(categoria.value, 0)
+        if valor > 0:
+            filas.append((int(uid), valor, f.get("raza", "?")))
+    if not filas:
+        await interaction.response.send_message("Todavía no hay nadie en este ranking.", ephemeral=True)
+        return
+    filas.sort(key=lambda x: -x[1])
+    medallas = ["🥇", "🥈", "🥉"]
+    lineas = [
+        f"{medallas[i] if i < 3 else f'**{i + 1}.**'} <@{uid}> · {raza_txt} — **{valor:,}**"
+        for i, (uid, valor, raza_txt) in enumerate(filas[:10])
+    ]
+    embed = discord.Embed(title=f"🏆 Top: {categoria.name}", description="\n".join(lineas), color=0xF1C40F)
+    await interaction.response.send_message(embed=embed)
 
 
 # ============================================================
