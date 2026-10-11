@@ -28,11 +28,48 @@ from habilidades import texto_habilidad
 #  El dueño del servidor siempre. Ademas, las personas y roles que el
 #  dueño elija en /configuracion (y, si existe, el ADMIN_ID de Railway).
 # ============================================================
-def es_admin_unico(interaction: discord.Interaction) -> bool:
-    if es_dueno_servidor(interaction):
-        return True
+_DUENOS = {}   # {guild_id: owner_id} (para no consultar a Discord cada vez)
+
+
+async def guild_completa(interaction: discord.Interaction):
+    """A veces interaction.guild llega 'a medias' (sin nombre ni dueño). Esto busca el servidor completo."""
+    g = interaction.client.get_guild(interaction.guild_id)
+    if g is None:
+        try:
+            g = await interaction.client.fetch_guild(interaction.guild_id)
+        except discord.HTTPException:
+            g = interaction.guild
+    return g
+
+
+async def id_dueno(interaction: discord.Interaction):
+    gid = interaction.guild_id
+    if gid in _DUENOS:
+        return _DUENOS[gid]
+    owner = getattr(interaction.guild, "owner_id", None)
+    if owner is None:
+        g = await guild_completa(interaction)
+        owner = getattr(g, "owner_id", None)
+    if owner is not None:
+        _DUENOS[gid] = owner
+    return owner
+
+
+async def es_dueno(interaction: discord.Interaction) -> bool:
+    """Dueño del servidor (o el ADMIN_ID de Railway). Si Discord no dice quién es el dueño,
+    se acepta a quien tenga el permiso de Administrador."""
     admin_id = os.getenv("ADMIN_ID", "").strip()
     if admin_id.isdigit() and interaction.user.id == int(admin_id):
+        return True
+    owner = await id_dueno(interaction)
+    if owner is not None:
+        return interaction.user.id == owner
+    permisos = getattr(interaction, "permissions", None)
+    return bool(permisos and permisos.administrator)
+
+
+async def es_admin_unico(interaction: discord.Interaction) -> bool:
+    if await es_dueno(interaction):
         return True
     conf = config_guild(interaction.guild_id)
     if interaction.user.id in conf.get("admin_usuarios", []):
@@ -42,7 +79,7 @@ def es_admin_unico(interaction: discord.Interaction) -> bool:
 
 
 async def exigir_admin(interaction: discord.Interaction) -> bool:
-    if es_admin_unico(interaction):
+    if await es_admin_unico(interaction):
         return True
     await interaction.response.send_message(
         "🚫 No tienes permiso para este comando. El dueño del servidor decide quién es admin con /configuracion.",
@@ -1062,32 +1099,51 @@ def _alternar(lista, i):
         lista.append(i)
 
 
-def embed_config(guild):
+def embed_config(guild, owner_id=None):
     conf = config_guild(guild.id)
+    nombre = guild.name or "tu servidor"
+    linea = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     embed = discord.Embed(
-        title="⚙️ Panel de Configuración",
+        title="⚙️  PANEL DE CONFIGURACIÓN",
         description=(
-            f"Bienvenido al panel de **{guild.name}**.\n"
-            "Aquí decides **quién puede usar los comandos de admin** y cómo funciona el bot.\n"
-            "▫️ Los menús *añaden o quitan*: elige a alguien que ya está y se le quita."
+            f"{linea}\n"
+            f"✨ Bienvenido al panel de **{nombre}**\n"
+            "Aquí decides **quién manda** en el bot y cómo funciona.\n"
+            f"{linea}\n"
+            "💡 *Los menús funcionan como interruptor: elige a alguien para añadirlo y vuelve a elegirlo para quitarlo.*"
         ),
         color=0xC9A227,
+        timestamp=discord.utils.utcnow(),
     )
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="👑 Dueño (siempre es admin)", value=f"<@{guild.owner_id}>", inline=False)
-    embed.add_field(name="🛡️ Admins (personas)", value=_menciones(conf.get("admin_usuarios", [])), inline=True)
-    embed.add_field(name="🎖️ Admins (roles)", value=_menciones(conf.get("admin_roles", []), rol=True), inline=True)
+    icono = guild.icon.url if getattr(guild, "icon", None) else None
+    if icono:
+        embed.set_thumbnail(url=icono)
+        embed.set_author(name=nombre, icon_url=icono)
+    else:
+        embed.set_author(name=nombre)
+    dueno = f"<@{owner_id}>" if owner_id else "El dueño del servidor"
+    embed.add_field(name="👑  Dueño", value=f"{dueno}\n*Siempre es admin*", inline=False)
+    embed.add_field(name="🛡️  Admins (personas)", value=_menciones(conf.get("admin_usuarios", [])), inline=True)
+    embed.add_field(name="🎖️  Admins (roles)", value=_menciones(conf.get("admin_roles", []), rol=True), inline=True)
     jugadores = conf.get("jugador_roles", [])
     embed.add_field(
-        name="🎮 Roles que pueden jugar",
-        value=_menciones(jugadores, rol=True) if jugadores else "✅ Todo el mundo puede jugar",
+        name="🎮  Quién puede jugar",
+        value=_menciones(jugadores, rol=True) if jugadores else "✅ Todo el mundo",
         inline=False,
     )
-    embed.add_field(name="🪙 Moneda", value=f'{conf["moneda_emoji"]}  (ejemplo: {moneda(guild.id, 1000)})', inline=True)
-    embed.add_field(name="🧙 Personajes creados", value=f"{sum(1 for f in cargar().values() if f.get('raza_id')):,}", inline=True)
+    embed.add_field(name="🪙  Moneda", value=f'{conf["moneda_emoji"]}  →  {moneda(guild.id, 1000)}', inline=True)
+    embed.add_field(
+        name="🧙  Personajes creados",
+        value=f"**{sum(1 for f in cargar().values() if f.get('raza_id')):,}**",
+        inline=True,
+    )
     embed.set_footer(text="🔒 Solo el dueño del servidor puede cambiar esto")
     return embed
+
+
+async def _embed(interaction: discord.Interaction):
+    g = await guild_completa(interaction)
+    return embed_config(g, await id_dueno(interaction))
 
 
 class ModalMoneda(discord.ui.Modal):
@@ -1101,7 +1157,7 @@ class ModalMoneda(discord.ui.Modal):
         conf = config_guild(interaction.guild_id)
         conf["moneda_emoji"] = self.campo.value.strip() or "🪙"
         guardar_config_guild(interaction.guild_id, conf)
-        await interaction.response.edit_message(embed=embed_config(interaction.guild), view=self.vista)
+        await interaction.response.edit_message(embed=await _embed(interaction), view=self.vista)
 
 
 class VistaConfig(VistaBase):
@@ -1109,7 +1165,7 @@ class VistaConfig(VistaBase):
         super().__init__(dueno_id, timeout=600)
 
     async def _refrescar(self, interaction):
-        await interaction.response.edit_message(embed=embed_config(interaction.guild), view=self)
+        await interaction.response.edit_message(embed=await _embed(interaction), view=self)
 
     @discord.ui.select(
         cls=discord.ui.UserSelect, row=0, min_values=1, max_values=10,
@@ -1178,11 +1234,11 @@ class VistaConfig(VistaBase):
 @bot.tree.command(name="configuracion", description="Panel del dueño: elige quién puede usar los comandos de admin")
 @app_commands.guild_only()
 async def configuracion(interaction: discord.Interaction):
-    if not es_dueno_servidor(interaction):
+    if not await es_dueno(interaction):
         await interaction.response.send_message("👑 Solo el dueño del servidor puede abrir este panel.", ephemeral=True)
         return
     await interaction.response.send_message(
-        embed=embed_config(interaction.guild), view=VistaConfig(interaction.user.id), ephemeral=True
+        embed=await _embed(interaction), view=VistaConfig(interaction.user.id), ephemeral=True
     )
 
 
